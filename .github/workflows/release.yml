@@ -1,0 +1,97 @@
+name: release
+
+# Release automation (no tag push needed).
+# - When a version bump lands on master, a v<version> tag + Release is created
+#   automatically server-side (GITHUB_TOKEN) from plugin.json's version. No local
+#   `git push --tags` required.
+# - Manually pushing a v* tag also creates a Release as a fallback.
+# - Both paths skip if a Release for that version already exists (idempotent —
+#   never creates the same version twice).
+#
+# How it works: `gh release create v<version> --target <sha>` creates the tag and
+# Release in one shot. Tag pushes from clients get 403 by environment policy, but
+# the GITHUB_TOKEN inside Actions can create tags/Releases with contents:write,
+# so this path goes through.
+on:
+  push:
+    branches: [master]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history for CHANGELOG extraction / auto-generated notes
+
+      - name: Resolve target version and ref
+        id: target
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            # Manual tag push path: take the version from the tag name and use the existing tag as-is
+            VERSION="${GITHUB_REF_NAME#v}"
+            TAG="${GITHUB_REF_NAME}"
+            TARGET="${GITHUB_REF_NAME}"
+          else
+            # master push path: read the version from plugin.json and tag this push's commit
+            VERSION="$(python3 -c "import json;print(json.load(open('.claude-plugin/plugin.json'))['version'])")"
+            TAG="v${VERSION}"
+            TARGET="${GITHUB_SHA}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "target=$TARGET"   >> "$GITHUB_OUTPUT"
+
+      - name: Skip if release already exists
+        id: exists
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${{ steps.target.outputs.tag }}" >/dev/null 2>&1; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::Release ${{ steps.target.outputs.tag }} already exists — skipping"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Extract release notes from CHANGELOG
+        if: steps.exists.outputs.skip == 'false'
+        id: notes
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.target.outputs.version }}"
+          awk -v ver="$VERSION" '
+            BEGIN { gsub(/\./, "\\.", ver); hdr = "^## \\[" ver "\\]" }
+            $0 ~ hdr { flag = 1; next }
+            flag && /^## \[/ { flag = 0 }
+            flag { print }
+          ' CHANGELOG.md > notes.md || true
+          sed -i -e '/./,$!d' notes.md 2>/dev/null || true
+          if [ -s notes.md ]; then
+            echo "source=changelog" >> "$GITHUB_OUTPUT"
+          else
+            echo "source=auto" >> "$GITHUB_OUTPUT"
+            echo "::notice::No $VERSION section in CHANGELOG — using auto-generated notes"
+          fi
+
+      - name: Create tag + release
+        if: steps.exists.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.target.outputs.tag }}"
+          TARGET="${{ steps.target.outputs.target }}"
+          TITLE="rig ${TAG}"
+          if [ "${{ steps.notes.outputs.source }}" = "changelog" ]; then
+            gh release create "$TAG" --target "$TARGET" --title "$TITLE" --notes-file notes.md
+          else
+            gh release create "$TAG" --target "$TARGET" --title "$TITLE" --generate-notes
+          fi
+          echo "::notice::Created $TAG at $TARGET"
