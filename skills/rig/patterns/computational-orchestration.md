@@ -1,0 +1,89 @@
+# pattern: computational-orchestration
+
+**舵をコードが握る** — rig engine（SKILL.md）の制御ループは既定では散文で、遷移を握るのは LLM（SKILL.md を読んで「次の step へ」と判断する）。このパターンは、**step の遷移・ゲート判定・リトライ・停止条件・状態保持を、決定論ランナー `scripts/orchestrate.py` に強制させる**。モデルは各 step の「作業」をするが、「次に何をするか」はコードが決める。**opt-in（`--orchestrate` 明示時のみ）。**
+
+> なぜ要るか：acceptance-gate は「品質を収束させる」仕組みだが、その**ループを回す手綱**は依然 LLM が握っていた（prose 強制）。`harness-taxonomy` の基準＝「prose の依頼 ≪ コードの強制」を、rig 自身の制御ループにも当てる。計算的ガイドとして遷移を強制すれば、ループは context 圧縮・再起動を跨いでも同じ状態機械を辿る（persistence）。
+
+## 何が決定論になるか
+
+| 要素 | 既定（散文・LLM） | `--orchestrate`（コード・決定論） |
+|---|---|---|
+| 次の step | モデルが SKILL.md を読んで判断 | ランナーが cursor を進める |
+| ゲート合否 | モデルが「通った」と判断 | 機械検証(checks)＋独立 verdict をコードが集計 |
+| リトライ/停止 | モデルが K 回を数える | ランナーが retries/K・停止条件を強制 |
+| 状態保持 | 文脈に依存（圧縮で消える） | `run-state.json` に永続（再開可能） |
+| 採点者≠生成者 | 規律（守られないことがある） | by=self/generator の verdict を**ブロック** |
+
+## ランナーの契約（`scripts/orchestrate.py`）
+
+```
+plan    <recipe>                 ステップ状態機械を算出（モデル不要・--json 可）
+init    <recipe> [--goal G] [--out run-state.json]
+                                 run-state を作り最初のアクションを出す
+next    <run-state.json>         次の遷移を決定論的に計算・適用（START/ADVANCE/RETRY/AWAIT/BLOCKED/ESCALATE/DONE）
+resume  <run-state.json>         verify-first 再開：ダイジェスト表示 → 現 running step の checks: を**再実行**し、
+                                 以前 pass していた check が今 fail するなら「世界がドリフトした」として前進を拒否（exit≠0）、
+                                 無事なら `next` と同じ遷移を出す。run-state の mtime が 1h 以上前なら compaction 手がかりを表示
+check   <run-state.json>         現 step の checks:（shell）を実行し pass/fail 記録（計算的センサー）
+verdict <run-state.json> --by <名> --pass|--fail [--note ...]
+                                 独立検証者の推論的判定を記録（採点者≠生成者）
+status  <run-state.json>         現在の状態
+selftest                         決定論の自己検証
+```
+
+## RUN ループ（モデル側の使い方）
+
+1. `init <recipe>` で run-state を作る（`plan` で先に状態機械だけ見てもよい＝`--plan` 相当）。
+2. ランナーが `START step X` を出す → モデルは X の作業を**委譲**（context-minimal・engine 規則どおり）。
+3. ゲートのある step：
+   - 機械検証があれば `check`（lint/test/build 等を実行＝**計算的センサー一次**）。
+   - 観点検証が要れば、**生成者と別の reviewer** が `verdict --by <reviewer> --pass|--fail`（採点者≠生成者）。
+4. `next` を呼ぶ → ランナーが決定論的に遷移を返す：
+   - `ADVANCE`（合格）/ `RETRY`（未達・try n/K）/ `AWAIT`（check/verdict 待ち）/ `BLOCKED`（自己採点）/ `ESCALATE`（K 回未達→停止）/ `DONE`。
+5. `ESCALATE`/`BLOCKED` は**進めない**（無限ループ禁止・自己採点禁止）。`DONE` まで 2〜4 を繰り返す。
+
+## recipe 側の任意フィールド `checks:`（計算的センサーの接続点）
+
+step に機械検証コマンドを宣言すると、ランナーが実行してゲートの一次根拠にする（宣言が無い gated step は独立 verdict を要求）。プロジェクト依存なので **manifest / user recipe** で足すのが基本（shipped recipe は汎用のため未宣言）。
+
+```yaml
+steps:
+  - id: verify
+    instruction: verify
+    gate: acceptance-gate
+    checks:                       # 任意・決定論的バックプレッシャー（全件 exit 0 で合格）
+      - "npm test"
+      - "npm run lint"
+      - "npm run typecheck"
+```
+
+## 外部ランナー（`run`）— 各 step を別プロセスのエージェントで自走実行
+
+`next`/`check`/`verdict` を**現在のモデルが手で回す**代わりに、`run` は**各 step を別プロセスのエージェントに実行させ、遷移を自動で回す**（外部オーケストレーション）。プロセス境界が context を隔離し、検証を別プロバイダ/別プロセスにすれば**採点者≠生成者が構造的に**成立する。
+
+```
+orchestrate run <recipe> --provider <claude|codex|cmd|mock> \
+    [--verifier-provider <name>] [--provider-cmd "tool {prompt}"] [--isolate] \
+    [--step-model <step-id>=<model>]… [--goal G] [--max-steps N] [--out run-state.json]
+```
+
+- **プロバイダ抽象（マルチプロバイダ）**：**`rig`（各 step を `rig` skill で起動した別プロセス＝再帰 rig ハーネス・推奨）** / `claude`（`claude -p`）/ `codex`（`codex exec`）/ **`ollama`・`lmstudio`（ローカル LLM・OpenAI 互換 HTTP）** / `cmd`（任意 CLI を `{prompt}` テンプレートで）/ `mock`（決定論ダミー・テスト用）。生成と検証で**別プロバイダ**を指定できる（例 `--provider rig --verifier-provider codex`＝別モデルが独立検証）。`rig` は各 step を rig の engine（PARSE→RESOLVE→COMPOSE→RUN）で実行し、検証者は独立レビュアーとして `VERDICT: PASS|FAIL` を返す。
+- **ローカル LLM（`ollama`/`lmstudio`）**：OpenAI 互換エンドポイント（既定 `:11434`/`:1234`、`--base-url` で上書き）へ HTTP で問い合わせる。`--model <name>` でモデル指定（ollama 既定 `llama3.1`）。要：ローカルサーバ起動＋モデル取得。各リクエストは独立＝context 隔離は保たれる。サーバ不在時はゲート FAIL→エスカレーション（crash しない）。
+- **step 単位のモデル上書き（`--step-model`）**：`--step-model <step-id>=<model>`（繰り返し可）で特定 step の generator モデルだけを実行時に差し替える。優先順位は **`--step-model` > recipe の `model:` > `--model`**。未知の step-id は実行前に ERROR（黙って無視しない）、上書きは run-state の history に `STEP_MODEL_OVERRIDE` として記録される（#293）。
+- **動的モデル探索**：`orchestrate models [--save]` で起動中のサーバの `/v1/models` を叩いて**利用可能モデルを動的取得**（`claude`/`codex`/`rig` は CLI 有無）。`run --auto-model`（=`--auto-model-setting`）は `--model` 未指定時、保存設定（`~/.claude/rig/models.json`）→実機の先頭モデル→既定 の順で**自動解決**。サーバ不在でも既定にフォールバック（graceful）。
+- **プロセス隔離**：step ごとに新規プロセス＝**毎回クリーンな context**（Context Rot 対策の構造版）。親が肥大しない（Thin Harness）。
+- **構造的な独立検証**：gated step で checks 未宣言なら、**別プロセスの verifier** が `VERDICT: PASS|FAIL` を返す。by は `<provider>:<persona>`＝生成者と別（`policies/independent-verification` をプロセス境界で強制）。さらに **verifier ロールの CLI には読み取り専用権限を argv で固定付与**する（claude→`--allowedTools Read,Grep,Glob`／codex→`--sandbox read-only`）＝「検証役は書かない」がプロンプトのお願いではなく**機構**になる（採点者≠生成者の第2段）。
+- **`--isolate`（worktree 隔離実行）**：run を使い捨ての git worktree＋専用 branch（`rig/run-<recipe>-<ts>`）に隔離する。終了時の後始末は決定論規則（selftest X が golden 検証）——**DONE＋クリーン＋commit あり→元 branch へ ff 合流して撤収**／変更なし→撤収のみ／**未達・dirty・非 ff→worktree と branch を保全**して人の検分に委ねる。非決定的な生成過程が作業ツリーに触れず、**ゲートを通った成果だけが合流する**＝determinism-by-gate の空間版。
+- **並列レビュアー・ファンアウト**：gated step の `personas` を **N 人の同時プロセス**で走らせる（`parallel-fanout` の実プロセス版・`--max-parallel` で同時数）。集約は決定論（persona 名順）：`--quorum all`（既定＝review-gate と同じ全員一致・1人 FAIL でゲート不合格）か `--quorum majority`（過半数）。完了順に依らず同じ結論＝**並列でも決定論**。
+- **judge-panel（複数生成→勝者選択）**：`--generators a,b,c` で **複数プロバイダが同じ step を並列生成**し、judge（verifier）が各候補を判定。**最初に PASS した候補（generator 列の順＝決定論）が勝者**。例 `--generators rig,claude,codex`＝3モデルに作らせて一番筋の良いものを採る。誰も通らなければゲート不合格。
+- **step-DAG 並列**：step に `needs: [id…]` を宣言すると、**依存を満たした独立 step を同一 wave で同時プロセス実行**する（例 intake → {design, test 並走} → merge）。ready 集合は id 順・ゲート評価も id 順適用＝**並列でも決定論**。`needs` 未宣言の recipe は従来どおり直列。
+- **自走と安全**：遷移はランナーが決定論的に回す。`--max-steps` で上限、ゲート未達 K 回で `ESCALATE`、自己採点は `BLOCKED`。`run-state.json` に永続＝中断・再開可能。
+- **opt-in / 本物の再帰に注意**：`--provider` は明示必須（既定なし）。`claude` を指定すると**入れ子で claude が起動**する＝コスト・再帰に注意。設計確認やテストは `--provider mock`（別プロセスだが即返す決定論ダミー）で。
+
+## ガード
+
+- **opt-in**（`--orchestrate` 明示時のみ）。既定の散文ループは変えない（engine 不変）。
+- ランナーは**遷移の強制**に徹し、各 step の中身（実装・レビュー・検証の作業）は従来どおり engine／委譲先が回す（Thin Harness, Fat Skills）。
+- **機械検証(checks)を一次・推論 verdict を二次**（`harness-taxonomy`）。verdict は**生成者と別**（`policies/independent-verification`）— by=self/generator は BLOCKED。
+- 状態は `run-state.json` に持つ＝**圧縮・再起動を跨いで同じ状態機械を再開**できる（run-continuity の計算版）。長い中断からの再開は `resume`（verify-first）で世界のドリフトを先に検知してから続ける。
+- **失敗の型付け（`failure_mode`）**：`run` が ESCALATE/BLOCKED で終わると、`telemetry_append` が `runs.jsonl` に決定論的な MAST 系失敗コード `failure_mode` を**加算**記録する（成功 run には付かない）。分類器は `runstate.classify_failure`（state からの再現可能な best-guess・モデル呼び出し無し）、コード語彙と「本来どのゲート/ブリックが捕まえるべきだったか」の写像は `patterns/failure-taxonomy` が正本。

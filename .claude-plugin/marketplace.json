@@ -1,0 +1,13 @@
+{
+  "name": "cowork-content-test",
+  "owner": {
+    "name": "sito"
+  },
+  "plugins": [
+    {
+      "name": "cowork-content-test",
+      "source": "./",
+      "description": "Throwaway copy of rig's actual HEAD content (no git history) to test whether Cowork's plugin browser fails on rig's real content rather than its history. Safe to ignore/delete."
+    }
+  ]
+}

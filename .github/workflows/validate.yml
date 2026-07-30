@@ -1,0 +1,49 @@
+name: validate
+
+# Quality gates for the repo itself: structural validator (+ its selftest),
+# orchestrator selftest, ruff lint, and the pytest suite.
+# Any failure blocks the PR / rejects the master push.
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.18.0'
+
+      - name: Install dependencies
+        run: pip install pyyaml 'ruff==0.15.8' pytest setuptools wheel 'tomli; python_version < "3.11"'
+
+      - name: Lint (ruff)
+        run: ruff check scripts rig_workbench tests
+
+      - name: Run rig structural validator
+        run: python3 scripts/validate.py
+
+      - name: Run rig structural validator selftest (fixture regression)
+        run: python3 scripts/validate.py selftest
+
+      - name: Run computational orchestrator selftest (determinism)
+        run: python3 scripts/orchestrate.py selftest
+
+      - name: Run pytest suite
+        run: pytest -q
